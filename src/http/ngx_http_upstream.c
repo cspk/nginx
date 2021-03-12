@@ -4948,26 +4948,6 @@ ngx_http_upstream_process_vary(ngx_http_request_t *r,
     u = r->upstream;
     u->headers_in.vary = h;
 
-#if (NGX_HTTP_CACHE)
-
-    if (u->conf->ignore_headers & NGX_HTTP_UPSTREAM_IGN_VARY) {
-        return NGX_OK;
-    }
-
-    if (r->cache == NULL) {
-        return NGX_OK;
-    }
-
-    if (h->value.len > NGX_HTTP_CACHE_VARY_LEN
-        || (h->value.len == 1 && h->value.data[0] == '*'))
-    {
-        u->cacheable = 0;
-    }
-
-    r->cache->vary = h->value;
-
-#endif
-
     return NGX_OK;
 }
 
