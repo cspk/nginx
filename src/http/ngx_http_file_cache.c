@@ -36,12 +36,6 @@ static ngx_http_file_cache_node_t *
     ngx_http_file_cache_lookup(ngx_http_file_cache_t *cache, u_char *key);
 static void ngx_http_file_cache_rbtree_insert_value(ngx_rbtree_node_t *temp,
     ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
-static void ngx_http_file_cache_vary(ngx_http_request_t *r, u_char *vary,
-    size_t len, u_char *hash);
-static void ngx_http_file_cache_vary_header(ngx_http_request_t *r,
-    ngx_md5_t *md5, ngx_str_t *name);
-static ngx_int_t ngx_http_file_cache_reopen(ngx_http_request_t *r,
-    ngx_http_cache_t *c);
 static ngx_int_t ngx_http_file_cache_update_variant(ngx_http_request_t *r,
     ngx_http_cache_t *c);
 static void ngx_http_file_cache_cleanup(void *data);
@@ -584,23 +578,6 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
         return NGX_DECLINED;
     }
 
-    if (h->vary_len > NGX_HTTP_CACHE_VARY_LEN) {
-        ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
-                      "cache file \"%s\" has incorrect vary length",
-                      c->file.name.data);
-        return NGX_DECLINED;
-    }
-
-    if (h->vary_len) {
-        ngx_http_file_cache_vary(r, h->vary, h->vary_len, c->variant);
-
-        if (ngx_memcmp(c->variant, h->variant, NGX_HTTP_CACHE_KEY_LEN) != 0) {
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "http file cache vary mismatch");
-            return ngx_http_file_cache_reopen(r, c);
-        }
-    }
-
     c->buf->last += n;
 
     c->valid_sec = h->valid_sec;
@@ -1054,191 +1031,6 @@ ngx_http_file_cache_rbtree_insert_value(ngx_rbtree_node_t *temp,
 }
 
 
-static void
-ngx_http_file_cache_vary(ngx_http_request_t *r, u_char *vary, size_t len,
-    u_char *hash)
-{
-    u_char     *p, *last;
-    ngx_str_t   name;
-    ngx_md5_t   md5;
-    u_char      buf[NGX_HTTP_CACHE_VARY_LEN];
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http file cache vary: \"%*s\"", len, vary);
-
-    ngx_md5_init(&md5);
-    ngx_md5_update(&md5, r->cache->main, NGX_HTTP_CACHE_KEY_LEN);
-
-    ngx_strlow(buf, vary, len);
-
-    p = buf;
-    last = buf + len;
-
-    while (p < last) {
-
-        while (p < last && (*p == ' ' || *p == ',')) { p++; }
-
-        name.data = p;
-
-        while (p < last && *p != ',' && *p != ' ') { p++; }
-
-        name.len = p - name.data;
-
-        if (name.len == 0) {
-            break;
-        }
-
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http file cache vary: %V", &name);
-
-        ngx_md5_update(&md5, name.data, name.len);
-        ngx_md5_update(&md5, (u_char *) ":", sizeof(":") - 1);
-
-        ngx_http_file_cache_vary_header(r, &md5, &name);
-
-        ngx_md5_update(&md5, (u_char *) CRLF, sizeof(CRLF) - 1);
-    }
-
-    ngx_md5_final(hash, &md5);
-}
-
-
-static void
-ngx_http_file_cache_vary_header(ngx_http_request_t *r, ngx_md5_t *md5,
-    ngx_str_t *name)
-{
-    size_t            len;
-    u_char           *p, *start, *last;
-    ngx_uint_t        i, multiple, normalize;
-    ngx_list_part_t  *part;
-    ngx_table_elt_t  *header;
-
-    multiple = 0;
-    normalize = 0;
-
-    if (name->len == sizeof("Accept-Charset") - 1
-        && ngx_strncasecmp(name->data, (u_char *) "Accept-Charset",
-                           sizeof("Accept-Charset") - 1) == 0)
-    {
-        normalize = 1;
-
-    } else if (name->len == sizeof("Accept-Encoding") - 1
-        && ngx_strncasecmp(name->data, (u_char *) "Accept-Encoding",
-                           sizeof("Accept-Encoding") - 1) == 0)
-    {
-        normalize = 1;
-
-    } else if (name->len == sizeof("Accept-Language") - 1
-        && ngx_strncasecmp(name->data, (u_char *) "Accept-Language",
-                           sizeof("Accept-Language") - 1) == 0)
-    {
-        normalize = 1;
-    }
-
-    part = &r->headers_in.headers.part;
-    header = part->elts;
-
-    for (i = 0; /* void */ ; i++) {
-
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-
-            part = part->next;
-            header = part->elts;
-            i = 0;
-        }
-
-        if (header[i].hash == 0) {
-            continue;
-        }
-
-        if (header[i].key.len != name->len) {
-            continue;
-        }
-
-        if (ngx_strncasecmp(header[i].key.data, name->data, name->len) != 0) {
-            continue;
-        }
-
-        if (!normalize) {
-
-            if (multiple) {
-                ngx_md5_update(md5, (u_char *) ",", sizeof(",") - 1);
-            }
-
-            ngx_md5_update(md5, header[i].value.data, header[i].value.len);
-
-            multiple = 1;
-
-            continue;
-        }
-
-        /* normalize spaces */
-
-        p = header[i].value.data;
-        last = p + header[i].value.len;
-
-        while (p < last) {
-
-            while (p < last && (*p == ' ' || *p == ',')) { p++; }
-
-            start = p;
-
-            while (p < last && *p != ',' && *p != ' ') { p++; }
-
-            len = p - start;
-
-            if (len == 0) {
-                break;
-            }
-
-            if (multiple) {
-                ngx_md5_update(md5, (u_char *) ",", sizeof(",") - 1);
-            }
-
-            ngx_md5_update(md5, start, len);
-
-            multiple = 1;
-        }
-    }
-}
-
-
-static ngx_int_t
-ngx_http_file_cache_reopen(ngx_http_request_t *r, ngx_http_cache_t *c)
-{
-    ngx_http_file_cache_t  *cache;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->file.log, 0,
-                   "http file cache reopen");
-
-    if (c->secondary) {
-        ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
-                      "cache file \"%s\" has incorrect vary hash",
-                      c->file.name.data);
-        return NGX_DECLINED;
-    }
-
-    cache = c->file_cache;
-
-    ngx_shmtx_lock(&cache->shpool->mutex);
-
-    c->node->count--;
-    c->node = NULL;
-
-    ngx_shmtx_unlock(&cache->shpool->mutex);
-
-    c->secondary = 1;
-    c->file.name.len = 0;
-    c->body_start = c->buffer_size;
-
-    ngx_memcpy(c->key, c->variant, NGX_HTTP_CACHE_KEY_LEN);
-
-    return ngx_http_file_cache_open(r);
-}
-
 
 ngx_int_t
 ngx_http_file_cache_set_header(ngx_http_request_t *r, u_char *buf)
@@ -1273,19 +1065,6 @@ ngx_http_file_cache_set_header(ngx_http_request_t *r, u_char *buf)
         ngx_memcpy(h->etag, c->etag.data, c->etag.len);
     }
 
-    if (c->vary.len) {
-        if (c->vary.len > NGX_HTTP_CACHE_VARY_LEN) {
-            /* should not happen */
-            c->vary.len = NGX_HTTP_CACHE_VARY_LEN;
-        }
-
-        h->vary_len = (u_char) c->vary.len;
-        ngx_memcpy(h->vary, c->vary.data, c->vary.len);
-
-        ngx_http_file_cache_vary(r, c->vary.data, c->vary.len, c->variant);
-        ngx_memcpy(h->variant, c->variant, NGX_HTTP_CACHE_KEY_LEN);
-    }
-
     if (ngx_http_file_cache_update_variant(r, c) != NGX_OK) {
         return NGX_ERROR;
     }
@@ -1311,12 +1090,6 @@ ngx_http_file_cache_update_variant(ngx_http_request_t *r, ngx_http_cache_t *c)
     ngx_http_file_cache_t  *cache;
 
     if (!c->secondary) {
-        return NGX_OK;
-    }
-
-    if (c->vary.len
-        && ngx_memcmp(c->variant, c->key, NGX_HTTP_CACHE_KEY_LEN) == 0)
-    {
         return NGX_OK;
     }
 
@@ -1535,19 +1308,6 @@ ngx_http_file_cache_update_header(ngx_http_request_t *r)
     if (c->etag.len <= NGX_HTTP_CACHE_ETAG_LEN) {
         h.etag_len = (u_char) c->etag.len;
         ngx_memcpy(h.etag, c->etag.data, c->etag.len);
-    }
-
-    if (c->vary.len) {
-        if (c->vary.len > NGX_HTTP_CACHE_VARY_LEN) {
-            /* should not happen */
-            c->vary.len = NGX_HTTP_CACHE_VARY_LEN;
-        }
-
-        h.vary_len = (u_char) c->vary.len;
-        ngx_memcpy(h.vary, c->vary.data, c->vary.len);
-
-        ngx_http_file_cache_vary(r, c->vary.data, c->vary.len, c->variant);
-        ngx_memcpy(h.variant, c->variant, NGX_HTTP_CACHE_KEY_LEN);
     }
 
     (void) ngx_write_file(&file, (u_char *) &h,
